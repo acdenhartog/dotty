@@ -1000,7 +1000,7 @@ object Parsers {
     def expr1Rest(t: Tree, location: Location.Value) = in.token match {
       case EQUALS =>
          t match {
-           case Ident(_) | Select(_, _) | Apply(_, _) =>
+           case Ident(_) | Select(_, _) | Apply(_, _) | Tuple(_) =>
              atPos(t.pos.start, in.skipToken()) { Assign(t, expr()) }
            case _ =>
              t

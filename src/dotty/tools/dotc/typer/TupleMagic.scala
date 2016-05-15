@@ -70,10 +70,38 @@ object TupleMagic {
       Only the last one is "really" pass-by-name
    */
 
+  //COMPLETE:
+  // split tuples into update(a,b)(x,y,z) =,
+  // () as empty tuple for varargs falls out automagically
 
+  //IN PROGRESS:
+  //todo handle | types...
+  //todo allow  _ in assignment into LHS tuples
+  //todo check behaiours of call-by-name update in every case
+  //todo avoid redundant hold of RHS tuple value
+  //todo write comprehensive tests
+  //todo investigate the List(a,b,c):_* issue
+    //todo make sure List(a,b,c):_* works in nested tuples
+
+  //todo maybe find auto-tupling to move it here?
+  //todo enable def(a,b,c:Int) syntax
+  //todo untuple of functions
+
+  //DELIBERATION:
+  //todo: partial var/val declaration inside assignment over tuples?
+  //todo: product OR type
+
+  //CANCLED:
+  //allow method1(a,b,c); method2():(a,b,c); method1(method2())
+    //on second thought, better not due to ambiguity
+    //update method is special case due to syntax of assignments
+
+
+
+  //////////
 
   def isTuple(typedTree:tpd.Tree)
-             (implicit ctx: Context) = {
+             (implicit ctx: Context):Boolean = {
 
     def unexpected(_tpe:Type) = { //this is a debugging method
       ctx.error(s"RHS type is probably not a Tuple: ${_tpe.show}")
@@ -93,7 +121,7 @@ object TupleMagic {
         //case symDenot:SymDenotation => unExpr(symDenot.info)
         case sngDenot:SingleDenotation => unExpr(sngDenot.infoOrCompleter)
         case _den =>
-          ctx.error(s"RHS denotation not a SymDenotation, what does this mean?!: ${_den.show}");
+          ctx.error(s"RHS denotation not a SingleDenotation, what does this mean?!: ${_den.show}");
           false
       }
       case tpe:RefinedType => defn.isTupleType(tpe)
@@ -102,6 +130,9 @@ object TupleMagic {
   }
 
   //todo: find Tuple extractor/unapply implemenation to check for code duplication
+  /**
+    * @ruturn ( val hold = tuple() , List(hold._1,hold._2,...) )
+    */
   def splitTuple(tuple:tpd.Tree)
                 (implicit ctx: Context):(untpd.ValDef,List[untpd.Select]) = {
     val name = ctx.freshName().toTermName
@@ -112,40 +143,75 @@ object TupleMagic {
         .map(i=>untpd.Select(hold,nme.productAccessorName(1 + i))).toList)
   }
 
-  def maybeUnTuple(maybeTuple:untpd.Tree):List[untpd.Tree] =
-    maybeTuple match {
-      case untpd.Tuple(args) => args
-      case notTuple => notTuple :: Nil
-    }
 
-  def assignSplitTuple(lhs:untpd.Tuple,rhs:untpd.Tree)
-                      (implicit ctx: Context):untpd.Tree = {
-    rhs match {
-      case untpd.Tuple(rhsTrees) =>
-        if (rhsTrees.length != lhs.trees.length)
-          errorTree(rhs,s"Tuple sizes do not match.")
-        else untpd.Block((lhs.trees,rhsTrees).zipped.map(untpd.Assign),untpd.EmptyTree)
-      case maybeTuple =>
-        val typedRhs = ctx.typer.typed(maybeTuple)
-        if (isTuple(typedRhs)){
-          val (hold,parts) = splitTuple(typedRhs)
-          if (parts.length != lhs.trees.length)
-            errorTree(lhs,s"Tuple sizes do not match: $lhs ≠ $rhs:${typedRhs.tpe}")
-          else untpd.Block(hold :: (lhs.trees,parts).zipped.map(untpd.Assign),untpd.EmptyTree)
-        } else errorTree(rhs,s"RHS of assignment is not a Tuple:")
-    }
-  }
-
+  /** This method is called in typechecker because update methods can have a ruturn type.
+    *
+    * It handles assignment involving either update methods or RHS tuples.
+    *  This is done by reshaping the tree.
+    *
+    * Note: much of this handling is done recursively:
+    *   LHS tuple assingmentmets split appart,
+    *   then typechecker is called again on individual parts which could be split further.
+    */
   def assignmentMagic(tree: untpd.Assign, pt: Type)
                      (implicit ctx: Context):Option[tpd.Tree] = {
 
+    //Note: inner methods just using ctx directly "for efficiency",
+    //      perhaps wiser to (implicit ctx: Context) for each inner method?
+
+    /** handles update methods
+      *  first try legacy un-curried update method,
+      *  if typecheck fails:
+      *   use once-curried update method
+      */
     def updateMagic(canCopy: untpd.Tree,
                     update: untpd.Tree,
                     lhsArgs: List[untpd.Tree]):tpd.Tree =
-      ctx.typer.tryEither { implicit ctx =>
+      ctx.typer.tryEither { implicit ctx => // obj(x) = y
         ctx.typer.typed(untpd.cpy.Apply(canCopy)(update, lhsArgs :+ tree.rhs),pt)
-      } { (_,_) => //curried mode
-        ctx.typer.typed(untpd.Apply(untpd.cpy.Apply(canCopy)(update,lhsArgs),maybeUnTuple(tree.rhs)),pt)
+      } { (_,_) => // curried update method
+        maybeUnTuple(tree.rhs) match {
+          case (None,rhsArgs) => // obj(x) = a:A | obj(x) = (a,b,c)
+            ctx.typer.typed(
+              untpd.Apply(untpd.cpy.Apply(canCopy)(update,lhsArgs),rhsArgs),pt)
+          case (Some(hold),rhsArgs) => // obj(x) = ab:(A,B)
+            ctx.typer.typed(
+              untpd.Block(hold,
+              untpd.Apply(untpd.cpy.Apply(canCopy)(update,lhsArgs),rhsArgs))
+              ,pt)
+        }
+      }
+
+    /** extract args for RHS of once-curried update method
+      */
+    def maybeUnTuple(maybeTuple:untpd.Tree):(Option[untpd.ValDef],List[untpd.Tree]) =
+      maybeTuple match {
+        case untpd.Tuple(args) => (None,args)
+        case _ =>
+          val typedMaybeTuple = ctx.typer.typed(maybeTuple)
+          if(isTuple(typedMaybeTuple)) {
+            splitTuple(typedMaybeTuple) match {
+              case (hold,parts) => (Some(hold),parts)
+            }
+          } else (None,untpd.TypedSplice(typedMaybeTuple) :: Nil)
+      }
+
+    /** assignment with tuple on LHS.
+      */
+    def assignSplitTuple(lhs:untpd.Tuple,rhs:untpd.Tree):untpd.Tree =
+      rhs match {
+        case untpd.Tuple(rhsTrees) => // (a,b) = (1,2)
+          if (rhsTrees.length != lhs.trees.length)
+            errorTree(rhs,s"Tuple sizes do not match.")
+          else untpd.Block((lhs.trees,rhsTrees).zipped.map(untpd.Assign),untpd.EmptyTree)
+        case maybeTuple => // (a,b) = ab
+          val typedRhs = ctx.typer.typed(maybeTuple)
+          if (isTuple(typedRhs)){
+            val (hold,parts) = splitTuple(typedRhs)
+            if (parts.length != lhs.trees.length)
+              errorTree(lhs,s"Tuple sizes do not match: $lhs ≠ $rhs:${typedRhs.tpe}")
+            else untpd.Block(hold :: (lhs.trees,parts).zipped.map(untpd.Assign),untpd.EmptyTree)
+          } else errorTree(rhs,s"RHS of assignment is not a Tuple:")
       }
 
     tree.lhs match {
@@ -161,14 +227,4 @@ object TupleMagic {
     }
   }
 
-
-  //todo: maybe allow method1(a,b,c); method2():(a,b,c); method1(method2())
-  def applySplitTuple(fn:tpd.Tree,tuple:tpd.Tree)
-                     (implicit ctx: Context):untpd.Block = {
-    val (hold,parts) = splitTuple(tuple)
-    untpd.Block(hold,untpd.Apply(fn,parts))
-  }
-
-
-  //todo maybe find auto-tupling to move it here?
 }

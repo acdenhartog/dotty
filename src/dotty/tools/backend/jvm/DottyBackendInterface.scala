@@ -12,7 +12,7 @@ import scala.collection.generic.Clearable
 import scala.collection.mutable
 import scala.reflect.ClassTag
 import scala.reflect.internal.util.WeakHashSet
-import scala.reflect.io.{Directory, PlainDirectory, AbstractFile}
+import scala.reflect.io.{AbstractFile, Directory, PlainDirectory}
 import scala.tools.asm.{AnnotationVisitor, ClassVisitor, FieldVisitor, MethodVisitor}
 import scala.tools.nsc.backend.jvm.{BCodeHelpers, BackendInterface}
 import dotty.tools.dotc.core._
@@ -24,15 +24,21 @@ import Symbols._
 import Denotations._
 import Phases._
 import java.lang.AssertionError
-import dotty.tools.dotc.util.{Positions, DotClass}
+
+import dotty.tools.dotc.util.{DotClass, Positions}
 import Decorators._
 import tpd._
+
 import scala.tools.asm
 import NameOps._
 import StdNames.nme
 import NameOps._
+import dotty.tools.dotc.core
+import dotty.tools.dotc.core.Names.TypeName
 
-class DottyBackendInterface(outputDirectory: AbstractFile)(implicit ctx: Context) extends BackendInterface{
+import scala.annotation.tailrec
+
+class DottyBackendInterface(outputDirectory: AbstractFile, val superCallsMap: Map[Symbol, Set[ClassSymbol]])(implicit ctx: Context) extends BackendInterface{
   type Symbol          = Symbols.Symbol
   type Type            = Types.Type
   type Tree            = tpd.Tree
@@ -633,7 +639,7 @@ class DottyBackendInterface(outputDirectory: AbstractFile)(implicit ctx: Context
         toDenot(sym)(shiftedContext).isStatic(shiftedContext)
       }
 
-    def isStaticConstructor: Boolean = isStaticMember && isClassConstructor
+    def isStaticConstructor: Boolean = (isStaticMember && isClassConstructor) || (sym.name eq core.Names.STATIC_CONSTRUCTOR)
 
 
     // navigation
@@ -716,7 +722,7 @@ class DottyBackendInterface(outputDirectory: AbstractFile)(implicit ctx: Context
       toDenot(sym).info.decls.filter(p => p.isTerm && !p.is(Flags.Method)).toList
     }
     def methodSymbols: List[Symbol] =
-      for (f <- toDenot(sym).info.decls.toList if !f.isMethod && f.isTerm && !f.isModule) yield f
+      for (f <- toDenot(sym).info.decls.toList if f.isMethod && f.isTerm && !f.isModule) yield f
     def serialVUID: Option[Long] = None
 
 
@@ -735,9 +741,14 @@ class DottyBackendInterface(outputDirectory: AbstractFile)(implicit ctx: Context
 
     /**
      * All interfaces implemented by a class, except for those inherited through the superclass.
-     *
+     * Redundant interfaces are removed unless there is a super call to them.
      */
-    def superInterfaces: List[Symbol] = decorateSymbol(sym).directlyInheritedTraits
+    def superInterfaces: List[Symbol] = {
+      val directlyInheritedTraits = decorateSymbol(sym).directlyInheritedTraits
+      val allBaseClasses = directlyInheritedTraits.iterator.flatMap(_.symbol.asClass.baseClasses.drop(1)).toSet
+      val superCalls = superCallsMap.getOrElse(sym, Set.empty)
+      directlyInheritedTraits.filter(t => !allBaseClasses(t) || superCalls(t))
+    }
 
     /**
      * True for module classes of package level objects. The backend will generate a mirror class for
@@ -861,11 +872,11 @@ class DottyBackendInterface(outputDirectory: AbstractFile)(implicit ctx: Context
               "If possible, please file a bug on issues.scala-lang.org.")
 
           tp match {
-            case ThisType(ArrayClass)               => ObjectReference.asInstanceOf[ct.bTypes.ClassBType] // was introduced in 9b17332f11 to fix SI-999, but this code is not reached in its test, or any other test
-            case ThisType(sym)                      => storage.getClassBTypeAndRegisterInnerClass(sym.asInstanceOf[ct.int.Symbol])
-           // case t: SingletonType                 => primitiveOrClassToBType(t.classSymbol)
-            case t: SingletonType                  => t.underlying.toTypeKind(ct)(storage)
-            case t: RefinedType                   =>  t.parent.toTypeKind(ct)(storage) //parents.map(_.toTypeKind(ct)(storage).asClassBType).reduceLeft((a, b) => a.jvmWiseLUB(b))
+            case tp: ThisType if tp.cls == ArrayClass => ObjectReference.asInstanceOf[ct.bTypes.ClassBType] // was introduced in 9b17332f11 to fix SI-999, but this code is not reached in its test, or any other test
+            case tp: ThisType                         => storage.getClassBTypeAndRegisterInnerClass(tp.cls.asInstanceOf[ct.int.Symbol])
+           // case t: SingletonType                   => primitiveOrClassToBType(t.classSymbol)
+            case t: SingletonType                     => t.underlying.toTypeKind(ct)(storage)
+            case t: RefinedType                       =>  t.parent.toTypeKind(ct)(storage) //parents.map(_.toTypeKind(ct)(storage).asClassBType).reduceLeft((a, b) => a.jvmWiseLUB(b))
           }
       }
     }

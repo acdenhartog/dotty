@@ -383,6 +383,7 @@ object StdNames {
     val delayedInit: N          = "delayedInit"
     val delayedInitArg: N       = "delayedInit$body"
     val drop: N                 = "drop"
+    val dynamics: N             = "dynamics"
     val dummyApply: N           = "<dummy-apply>"
     val elem: N                 = "elem"
     val emptyValDef: N          = "emptyValDef"
@@ -394,6 +395,7 @@ object StdNames {
     val equals_ : N             = "equals"
     val error: N                = "error"
     val eval: N                 = "eval"
+    val eqAny: N                = "eqAny"
     val ex: N                   = "ex"
     val experimental: N         = "experimental"
     val f: N                    = "f"
@@ -527,12 +529,6 @@ object StdNames {
     val nullRuntimeClass: N     = "scala.runtime.Null$"
 
     val synthSwitch: N          = "$synthSwitch"
-
-    val hkApply: N              = "$Apply"
-    val hkArgPrefix: N          = "$hk"
-    val hkLambdaPrefix: N       = "Lambda$"
-    val hkArgPrefixHead: Char   = hkArgPrefix.head
-    val hkArgPrefixLength: Int  = hkArgPrefix.length
 
     // unencoded operators
     object raw {
@@ -738,18 +734,18 @@ object StdNames {
   class ScalaTypeNames extends ScalaNames[TypeName] {
     protected implicit def fromString(s: String): TypeName = typeName(s)
 
-    @switch def syntheticTypeParamName(i: Int): TypeName = "T" + i
+    def syntheticTypeParamName(i: Int): TypeName = "T" + i
+    def syntheticLambdaParamName(i: Int): TypeName = "X" + i
 
     def syntheticTypeParamNames(num: Int): List[TypeName] =
       (0 until num).map(syntheticTypeParamName)(breakOut)
 
-    def hkLambda(vcs: List[Int]): TypeName = hkLambdaPrefix ++ vcs.map(varianceSuffix).mkString
-    def hkArg(n: Int): TypeName = hkArgPrefix ++ n.toString
-
-    def varianceSuffix(v: Int): Char = varianceSuffixes.charAt(v + 1)
-    val varianceSuffixes = "NIP"
+    def syntheticLambdaParamNames(num: Int): List[TypeName] =
+      (0 until num).map(syntheticLambdaParamName)(breakOut)
 
     final val Conforms = encode("<:<")
+
+    final val Uninstantiated: TypeName = "?$"
   }
 
   abstract class JavaNames[N <: Name] extends DefinedNames[N] {

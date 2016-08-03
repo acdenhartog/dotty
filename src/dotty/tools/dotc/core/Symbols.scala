@@ -361,11 +361,13 @@ trait Symbols { this: Context =>
 
 object Symbols {
 
+  implicit def eqSymbol: Eq[Symbol, Symbol] = Eq
+
   /** A Symbol represents a Scala definition/declaration or a package.
    *  @param coord  The coordinates of the symbol (a position or an index)
    *  @param id     A unique identifier of the symbol (unique per ContextBase)
    */
-  class Symbol private[Symbols] (val coord: Coord, val id: Int) extends DotClass with printing.Showable {
+  class Symbol private[Symbols] (val coord: Coord, val id: Int) extends DotClass with TypeParamInfo with printing.Showable {
 
     type ThisName <: Name
 
@@ -398,10 +400,10 @@ object Symbols {
 
     /** Subclass tests and casts */
     final def isTerm(implicit ctx: Context): Boolean =
-      (if(isDefinedInCurrentRun) lastDenot else denot).isTerm
+      (if (defRunId == ctx.runId) lastDenot else denot).isTerm
 
     final def isType(implicit ctx: Context): Boolean =
-      (if(isDefinedInCurrentRun) lastDenot else denot).isType
+      (if (defRunId == ctx.runId) lastDenot else denot).isType
 
     final def isClass: Boolean = isInstanceOf[ClassSymbol]
 
@@ -487,6 +489,15 @@ object Symbols {
      */
     def pos: Position = if (coord.isPosition) coord.toPosition else NoPosition
 
+    // TypeParamInfo methods
+    def isTypeParam(implicit ctx: Context) = denot.is(TypeParam)
+    def paramName(implicit ctx: Context) = name.asTypeName
+    def paramBounds(implicit ctx: Context) = denot.info.bounds
+    def paramBoundsAsSeenFrom(pre: Type)(implicit ctx: Context) = pre.memberInfo(this).bounds
+    def paramBoundsOrCompleter(implicit ctx: Context): Type = denot.infoOrCompleter
+    def paramVariance(implicit ctx: Context) = denot.variance
+    def paramRef(implicit ctx: Context) = denot.typeRef
+
 // -------- Printing --------------------------------------------------------
 
     /** The prefix string to be used when displaying this symbol without denotation */
@@ -517,7 +528,7 @@ object Symbols {
 
     /** The source or class file from which this class was generated, null if not applicable. */
     override def associatedFile(implicit ctx: Context): AbstractFile =
-      if (assocFile != null || (this.owner is PackageClass)) assocFile
+      if (assocFile != null || (this.owner is PackageClass) || this.isEffectiveRoot) assocFile
       else super.associatedFile
 
     final def classDenot(implicit ctx: Context): ClassDenotation =

@@ -12,6 +12,8 @@ import annotation.tailrec
  *  strengths and weaknesses of different collection architectures.
  *
  *  For a test file, see tests/run/CollectionTests.scala.
+ *
+ *  Strawman4 is like strawman1, but built over views instead of by-name iterators
  */
 object CollectionStrawMan4 {
 
@@ -216,7 +218,7 @@ object CollectionStrawMan4 {
     def fromIterable[B](coll: Iterable[B]): ListBuffer[B] = coll match {
       case pd @ View.Partitioned(partition: View.Partition[B]) =>
         partition.distribute(new ListBuffer[B]())
-        pd.forced.get.asInstanceOf[ListBuffer[B]]
+        new ListBuffer[B] ++= pd.forced.get
       case _ =>
         new ListBuffer[B] ++= coll
     }

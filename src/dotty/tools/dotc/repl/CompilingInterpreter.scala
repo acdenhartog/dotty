@@ -2,7 +2,10 @@ package dotty.tools
 package dotc
 package repl
 
-import java.io.{File, PrintWriter, StringWriter, Writer}
+import java.io.{
+  File, PrintWriter, PrintStream, StringWriter, Writer, OutputStream,
+  ByteArrayOutputStream => ByteOutputStream
+}
 import java.lang.{Class, ClassLoader}
 import java.net.{URL, URLClassLoader}
 
@@ -24,6 +27,7 @@ import dotty.tools.backend.jvm.GenBCode
 import Symbols._, Types._, Contexts._, StdNames._, Names._, NameOps._
 import Decorators._
 import scala.util.control.NonFatal
+import printing.SyntaxHighlighting
 
 /** An interpreter for Scala code which is based on the `dotc` compiler.
  *
@@ -56,7 +60,11 @@ import scala.util.control.NonFatal
  * @param ictx  The context to use for initialization of the interpreter,
  *              needed to access the current classpath.
  */
-class CompilingInterpreter(out: PrintWriter, ictx: Context) extends Compiler with Interpreter {
+class CompilingInterpreter(
+  out: PrintWriter,
+  ictx: Context,
+  parentClassLoader: Option[ClassLoader]
+) extends Compiler with Interpreter {
   import ast.untpd._
   import CompilingInterpreter._
 
@@ -78,6 +86,25 @@ class CompilingInterpreter(out: PrintWriter, ictx: Context) extends Compiler wit
 
   /** whether to print out result lines */
   private var printResults: Boolean = true
+  private var delayOutput: Boolean = false
+
+  val previousOutput = ListBuffer.empty[String]
+
+  override def lastOutput() = {
+    val prev = previousOutput.toList
+    previousOutput.clear()
+    prev
+  }
+
+  override def delayOutputDuring[T](operation: => T): T = {
+    val old = delayOutput
+    try {
+      delayOutput = true
+      operation
+    } finally {
+      delayOutput = old
+    }
+  }
 
   /** Temporarily be quiet */
   override def beQuietDuring[T](operation: => T): T = {
@@ -92,14 +119,18 @@ class CompilingInterpreter(out: PrintWriter, ictx: Context) extends Compiler wit
 
   private def newReporter = new ConsoleReporter(Console.in, out) {
     override def printMessage(msg: String) = {
-      out.print(/*clean*/(msg) + "\n")
-        // Suppress clean for now for compiler messages
-        // Otherwise we will completely delete all references to
-        // line$object$ module classes. The previous interpreter did not
-        // have the project because the module class was written without the final `$'
-        // and therefore escaped the purge. We can turn this back on once
-        // we drop the final `$' from module classes.
-      out.flush()
+      if (!delayOutput) {
+        out.print(/*clean*/(msg) + "\n")
+          // Suppress clean for now for compiler messages
+          // Otherwise we will completely delete all references to
+          // line$object$ module classes. The previous interpreter did not
+          // have the project because the module class was written without the final `$'
+          // and therefore escaped the purge. We can turn this back on once
+          // we drop the final `$' from module classes.
+        out.flush()
+      } else {
+        previousOutput += (/*clean*/(msg) + "\n")
+      }
     }
   }
 
@@ -108,8 +139,6 @@ class CompilingInterpreter(out: PrintWriter, ictx: Context) extends Compiler wit
 
   /** the compiler's classpath, as URL's */
   val compilerClasspath: List[URL] = ictx.platform.classPath(ictx).asURLs
-
-  protected def parentClassLoader: ClassLoader = classOf[Interpreter].getClassLoader
 
   /* A single class loader is used for all commands interpreted by this Interpreter.
      It would also be possible to create a new class loader for each command
@@ -126,8 +155,10 @@ class CompilingInterpreter(out: PrintWriter, ictx: Context) extends Compiler wit
   */
   /** class loader used to load compiled code */
   val classLoader: ClassLoader = {
-    val parent = new URLClassLoader(compilerClasspath.toArray, parentClassLoader)
-    new AbstractFileClassLoader(virtualDirectory, parent)
+    lazy val parent = new URLClassLoader(compilerClasspath.toArray,
+                                         classOf[Interpreter].getClassLoader)
+
+    new AbstractFileClassLoader(virtualDirectory, parentClassLoader.getOrElse(parent))
   }
 
   // Set the current Java "context" class loader to this interpreter's class loader
@@ -187,9 +218,11 @@ class CompilingInterpreter(out: PrintWriter, ictx: Context) extends Compiler wit
         if (!req.compile())
           Interpreter.Error // an error happened during compilation, e.g. a type error
         else {
-          val (interpreterResultString, succeeded) = req.loadAndRun()
-          if (printResults || !succeeded)
-            out.print(clean(interpreterResultString))
+          val (resultStrings, succeeded) = req.loadAndRun()
+          if (delayOutput)
+            previousOutput ++= resultStrings.map(clean)
+          else if (printResults || !succeeded)
+            resultStrings.map(x => out.print(clean(x)))
           if (succeeded) {
             prevRequests += req
             Interpreter.Success
@@ -198,6 +231,65 @@ class CompilingInterpreter(out: PrintWriter, ictx: Context) extends Compiler wit
         }
     }
   }
+
+  private def loadAndSetValue(objectName: String, value: AnyRef) = {
+    /** This terrible string is the wrapped class's full name inside the
+     *  classloader:
+     *  lineX$object$$iw$$iw$list$object
+     */
+    val objName: String = List(
+      currentLineName + INTERPRETER_WRAPPER_SUFFIX,
+      INTERPRETER_IMPORT_WRAPPER,
+      INTERPRETER_IMPORT_WRAPPER,
+      objectName
+    ).mkString("$")
+
+    try {
+      val resObj: Class[_] = Class.forName(objName, true, classLoader)
+      val setMethod = resObj.getDeclaredMethods.find(_.getName == "set")
+
+      setMethod.fold(false) { method =>
+        method.invoke(resObj, value) == null
+      }
+    } catch {
+      case NonFatal(_) =>
+        // Unable to set value on object due to exception during reflection
+        false
+    }
+  }
+
+  /** This bind is implemented by creating an object with a set method and a
+   *  field `value`. The value is then set via Java reflection.
+   *
+   *  Example: We want to bind a value `List(1,2,3)` to identifier `list` from
+   *  sbt. The bind method accomplishes this by creating the following:
+   *  {{{
+   *    object ContainerObjectWithUniqueID {
+   *      var value: List[Int] = _
+   *      def set(x: Any) = value = x.asInstanceOf[List[Int]]
+   *    }
+   *    val list = ContainerObjectWithUniqueID.value
+   *  }}}
+   *
+   *  Between the object being created and the value being assigned, the value
+   *  inside the object is set via reflection.
+   */
+  override def bind(id: String, boundType: String, value: AnyRef)(implicit ctx: Context): Interpreter.Result =
+    interpret(
+      """
+        |object %s {
+        |  var value: %s = _
+        |  def set(x: Any) = value = x.asInstanceOf[%s]
+        |}
+      """.stripMargin.format(id + INTERPRETER_WRAPPER_SUFFIX, boundType, boundType)
+    ) match {
+      case Interpreter.Success if loadAndSetValue(id + INTERPRETER_WRAPPER_SUFFIX, value) =>
+        val line = "val %s = %s.value".format(id, id + INTERPRETER_WRAPPER_SUFFIX)
+        interpret(line)
+      case Interpreter.Error | Interpreter.Incomplete =>
+        out.println("Set failed in bind(%s, %s, %s)".format(id, boundType, value))
+        Interpreter.Error
+    }
 
   /** Trait collecting info about one of the statements of an interpreter request */
   private trait StatementInfo {
@@ -271,7 +363,7 @@ class CompilingInterpreter(out: PrintWriter, ictx: Context) extends Compiler wit
     private def objectSourceCode: String =
       stringFrom { code =>
         // header for the wrapper object
-        code.println("object " + objectName + " {")
+        code.println(s"object $objectName{")
         code.print(importsPreamble)
         code.println(toCompute)
         handlers.foreach(_.extraCodeToEvaluate(this,code))
@@ -288,9 +380,9 @@ class CompilingInterpreter(out: PrintWriter, ictx: Context) extends Compiler wit
         from objectSourceCode */
     private def resultObjectSourceCode: String =
       stringFrom(code => {
-        code.println("object " + resultObjectName)
+        code.println(s"object $resultObjectName")
         code.println("{ val result: String = {")
-        code.println(objectName + accessPath + ";")  // evaluate the object, to make sure its constructor is run
+        code.println(s"$objectName$accessPath;")  // evaluate the object, to make sure its constructor is run
         code.print("(\"\"")  // print an initial empty string, so later code can
                             // uniformly be: + morestuff
         handlers.foreach(_.resultExtractionCode(this, code))
@@ -358,24 +450,53 @@ class CompilingInterpreter(out: PrintWriter, ictx: Context) extends Compiler wit
       names1 ++ names2
     }
 
+    /** Sets both System.{out,err} and Console.{out,err} to supplied
+     *  `os: OutputStream`
+     */
+    private def withOutput[T](os: ByteOutputStream)(op: ByteOutputStream => T) = {
+      val ps     = new PrintStream(os)
+      val oldOut = System.out
+      val oldErr = System.err
+      System.setOut(ps)
+      System.setErr(ps)
+
+      try {
+        Console.withOut(os)(Console.withErr(os)(op(os)))
+      } finally {
+        System.setOut(oldOut)
+        System.setErr(oldErr)
+      }
+    }
+
     /** load and run the code using reflection.
-     *  @return  A pair consisting of the run's result as a string, and
+     *  @return  A pair consisting of the run's result as a `List[String]`, and
      *           a boolean indicating whether the run succeeded without throwing
      *           an exception.
      */
-    def loadAndRun(): (String, Boolean) = {
+    def loadAndRun(): (List[String], Boolean) = {
       val interpreterResultObject: Class[_] =
         Class.forName(resultObjectName, true, classLoader)
-      val resultValMethod: java.lang.reflect.Method =
+      val valMethodRes: java.lang.reflect.Method =
         interpreterResultObject.getMethod("result")
       try {
-        (resultValMethod.invoke(interpreterResultObject).toString, true)
+        withOutput(new ByteOutputStream) { ps =>
+          val rawRes = valMethodRes.invoke(interpreterResultObject).toString
+          val res =
+            if (ictx.useColors) new String(SyntaxHighlighting(rawRes).toArray)
+            else rawRes
+          val prints = ps.toString("utf-8")
+          val printList = if (prints != "") prints :: Nil else Nil
+
+          if (!delayOutput) out.print(prints)
+
+          (printList :+ res, true)
+        }
       } catch {
         case NonFatal(ex) =>
           def cause(ex: Throwable): Throwable =
             if (ex.getCause eq null) ex else cause(ex.getCause)
           val orig = cause(ex)
-          (stringFrom(str => orig.printStackTrace(str)), false)
+          (stringFrom(str => orig.printStackTrace(str)) :: Nil, false)
       }
     }
 
@@ -584,12 +705,12 @@ class CompilingInterpreter(out: PrintWriter, ictx: Context) extends Compiler wit
       override val valAndVarNames = List(helperName)
 
       override def extraCodeToEvaluate(req: Request, code: PrintWriter): Unit = {
-        code.println("val " + helperName + " = " + statement.lhs + ";")
+        code.println(i"val $helperName = ${statement.lhs};")
       }
 
       /** Print out lhs instead of the generated varName */
       override def resultExtractionCode(req: Request, code: PrintWriter): Unit = {
-        code.print(" + \"" + lhs + ": " +
+        code.print(" + \"" + lhs.show + ": " +
           string2code(req.typeOf(helperName.encode)) +
           " = \" + " +
           string2code(req.fullPath(helperName))
@@ -680,6 +801,9 @@ class CompilingInterpreter(out: PrintWriter, ictx: Context) extends Compiler wit
     INTERPRETER_LINE_PREFIX + num
   }
 
+  private def currentLineName =
+    INTERPRETER_LINE_PREFIX + (nextLineNo - 1)
+
   /** next result variable number to use */
   private var nextVarNameNo = 0
 
@@ -727,10 +851,10 @@ class CompilingInterpreter(out: PrintWriter, ictx: Context) extends Compiler wit
       return str
 
     val trailer = "..."
-    if (maxpr >= trailer.length+1)
-      return str.substring(0, maxpr-3) + trailer
-
-    str.substring(0, maxpr)
+    if (maxpr >= trailer.length-1)
+      str.substring(0, maxpr-3) + trailer + "\n"
+    else
+      str.substring(0, maxpr-1)
   }
 
   /** Clean up a string for output */

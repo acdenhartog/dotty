@@ -277,6 +277,22 @@ object TypeErasure {
           else tp1
       }
   }
+
+  /** Does the (possibly generic) type `tp` have the same erasure in all its
+   *  possible instantiations?
+   */
+  def hasStableErasure(tp: Type)(implicit ctx: Context): Boolean = tp match {
+    case tp: TypeRef =>
+      tp.info match {
+        case TypeAlias(alias) => hasStableErasure(alias)
+        case _: ClassInfo => true
+        case _ => false
+      }
+    case tp: PolyParam => false
+    case tp: TypeProxy => hasStableErasure(tp.superType)
+    case tp: AndOrType => hasStableErasure(tp.tp1) && hasStableErasure(tp.tp2)
+    case _ => false
+  }
 }
 import TypeErasure._
 
@@ -374,7 +390,7 @@ class TypeErasure(isJava: Boolean, semiEraseVCs: Boolean, isConstructor: Boolean
               tr1 :: trs1.filterNot(_ isRef defn.ObjectClass)
             case nil => nil
           }
-        val erasedDecls = decls.filteredScope(d => !d.isType || d.isClass)
+        val erasedDecls = decls.filteredScope(sym => !sym.isType || sym.isClass)
         tp.derivedClassInfo(NoPrefix, parents, erasedDecls, erasedRef(tp.selfType))
           // can't replace selftype by NoType because this would lose the sourceModule link
       }
@@ -389,7 +405,7 @@ class TypeErasure(isJava: Boolean, semiEraseVCs: Boolean, isConstructor: Boolean
     def arrayErasure(tpToErase: Type) =
       erasureFn(isJava, semiEraseVCs = false, isConstructor, wildcardOK)(tpToErase)
     if (elemtp derivesFrom defn.NullClass) JavaArrayType(defn.ObjectType)
-    else if (isUnboundedGeneric(elemtp)) defn.ObjectType
+    else if (isUnboundedGeneric(elemtp) && !isJava) defn.ObjectType
     else JavaArrayType(arrayErasure(elemtp))
   }
 
@@ -430,7 +446,7 @@ class TypeErasure(isJava: Boolean, semiEraseVCs: Boolean, isConstructor: Boolean
       // constructor method should not be semi-erased.
       else if (isConstructor && isDerivedValueClass(sym)) eraseNormalClassRef(tp)
       else this(tp)
-    case RefinedType(parent, _) if !(parent isRef defn.ArrayClass) =>
+    case RefinedType(parent, _, _) if !(parent isRef defn.ArrayClass) =>
       eraseResult(parent)
     case _ =>
       this(tp)
@@ -474,6 +490,9 @@ class TypeErasure(isJava: Boolean, semiEraseVCs: Boolean, isConstructor: Boolean
         sigName(tp.widen)
       case ExprType(rt) =>
         sigName(defn.FunctionOf(Nil, rt))
+      case tp: TypeVar =>
+        val inst = tp.instanceOpt
+        if (inst.exists) sigName(inst) else tpnme.Uninstantiated
       case tp: TypeProxy =>
         sigName(tp.underlying)
       case ErrorType | WildcardType =>
@@ -490,4 +509,6 @@ class TypeErasure(isJava: Boolean, semiEraseVCs: Boolean, isConstructor: Boolean
       println(s"no sig for $tp")
       throw ex
   }
+
+
 }

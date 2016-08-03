@@ -15,7 +15,7 @@ import transform.TreeTransforms.{TreeTransform, TreeTransformer}
 import core.DenotTransformers.DenotTransformer
 import core.Denotations.SingleDenotation
 
-import dotty.tools.backend.jvm.{LabelDefs, GenBCode}
+import dotty.tools.backend.jvm.{LabelDefs, GenBCode, CollectSuperCalls}
 import dotty.tools.backend.sjs.GenSJSIR
 
 /** The central class of the dotc compiler. The job of a compiler is to create
@@ -42,7 +42,9 @@ class Compiler {
   def phases: List[List[Phase]] =
     List(
       List(new FrontEnd),           // Compiler frontend: scanner, parser, namer, typer
+      List(new sbt.ExtractDependencies), // Sends information on classes' dependencies to sbt via callbacks
       List(new PostTyper),          // Additional checks and cleanups after type checking
+      List(new sbt.ExtractAPI),     // Sends a representation of the API of classes to sbt via callbacks
       List(new Pickler),            // Generate TASTY info
       List(new FirstTransform,      // Some transformations to put trees into a canonical form
            new CheckReentrant),     // Internal use only: Check that compiled program has no data races involving global vars
@@ -55,12 +57,14 @@ class Compiler {
            new TailRec,             // Rewrite tail recursion to loops
            new LiftTry,             // Put try expressions that might execute on non-empty stacks into their own methods
            new ClassOf),            // Expand `Predef.classOf` calls.
-      List(new PatternMatcher,      // Compile pattern matches
+      List(new TryCatchPatterns,    // Compile cases in try/catch
+           new PatternMatcher,      // Compile pattern matches
            new ExplicitOuter,       // Add accessors to outer classes from nested ones.
            new ExplicitSelf,        // Make references to non-trivial self types explicit as casts
            new CrossCastAnd,        // Normalize selections involving intersection types.
            new Splitter),           // Expand selections involving union types into conditionals
       List(new VCInlineMethods,     // Inlines calls to value class methods
+           new IsInstanceOfEvaluator, // Issues warnings when unreachable statements are present in match/if expressions
            new SeqLiterals,         // Express vararg arguments as arrays
            new InterceptedMethods,  // Special handling of `==`, `|=`, `getClass` methods
            new Getters,             // Replace non-private vals and vars with getter defs (fields are added later)
@@ -88,6 +92,8 @@ class Compiler {
            new RestoreScopes),      // Repair scopes rendered invalid by moving definitions in prior phases of the group
       List(new ExpandPrivate,       // Widen private definitions accessed from nested classes
            new CollectEntryPoints,  // Find classes with main methods
+           new CollectSuperCalls,   // Find classes that are called with super
+           new MoveStatics,         // Move static methods to companion classes
            new LabelDefs),          // Converts calls to labels to jumps
       List(new GenSJSIR),           // Generate .js code
       List(new GenBCode)            // Generate JVM bytecode

@@ -21,7 +21,7 @@ object tpd extends Trees.Instance[Type] with TypedTreeInfo {
   private def ta(implicit ctx: Context) = ctx.typeAssigner
 
   def Modifiers(sym: Symbol)(implicit ctx: Context): Modifiers = Modifiers(
-    sym.flags & ModifierFlags,
+    sym.flags & (if (sym.isType) ModifierFlags | VarianceFlags else ModifierFlags),
     if (sym.privateWithin.exists) sym.privateWithin.asType.name else tpnme.EMPTY,
     sym.annotations map (_.tree))
 
@@ -847,9 +847,14 @@ object tpd extends Trees.Instance[Type] with TypedTreeInfo {
     assert(denot.exists, i"no member $receiver . $method, members = ${receiver.tpe.decls}")
     val selected =
       if (denot.isOverloaded) {
-        val allAlts = denot.alternatives.map(_.termRef)
-        val alternatives =
-          ctx.typer.resolveOverloaded(allAlts, proto, Nil)
+        def typeParamCount(tp: Type) = tp.widen match {
+          case tp: PolyType => tp.paramBounds.length
+          case _ => 0
+        }
+        var allAlts = denot.alternatives
+          .map(_.termRef).filter(tr => typeParamCount(tr) == targs.length)
+        if (targs.isEmpty) allAlts = allAlts.filterNot(_.widen.isInstanceOf[PolyType])
+        val alternatives = ctx.typer.resolveOverloaded(allAlts, proto)
         assert(alternatives.size == 1,
           i"${if (alternatives.isEmpty) "no" else "multiple"} overloads available for " +
           i"$method on ${receiver.tpe.widenDealias} with targs: $targs%, %; args: $args%, % of types ${args.tpes}%, %; expectedType: $expectedType." +

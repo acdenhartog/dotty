@@ -25,12 +25,21 @@ object Interpreter {
 trait Interpreter {
   import Interpreter._
 
-  /** Interpret one line of input.  All feedback, including parse errors
-   *  and evaluation results, are printed via the context's reporter.
-   *  reporter.  Values defined are available for future interpreted strings.
-   */
+ /** Interpret one line of input. All feedback, including parse errors and
+  *  evaluation results, are printed via the context's reporter. Values
+  *  defined are available for future interpreted strings.
+  */
   def interpret(line: String)(implicit ctx: Context): Result
+
+  /** Tries to bind an id to a value, returns the outcome of trying to bind */
+  def bind(id: String, boundType: String, value: AnyRef)(implicit ctx: Context): Result
 
   /** Suppress output during evaluation of `operation`. */
   def beQuietDuring[T](operation: => T): T
+
+  /** Suppresses output and saves it for `lastOutput` to collect */
+  def delayOutputDuring[T](operation: => T): T
+
+  /** Gets the last output not printed immediately */
+  def lastOutput(): Seq[String]
 }

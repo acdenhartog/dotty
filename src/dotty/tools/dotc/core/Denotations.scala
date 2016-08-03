@@ -70,6 +70,8 @@ import Decorators.SymbolIteratorDecorator
  */
 object Denotations {
 
+  implicit def eqDenotation: Eq[Denotation, Denotation] = Eq
+
   /** A denotation is the result of resolving
    *  a name (either simple identifier or select) during a given period.
    *
@@ -122,11 +124,11 @@ object Denotations {
     /** The signature of the denotation. */
     def signature(implicit ctx: Context): Signature
 
-    /** Resolve overloaded denotation to pick the one with the given signature
+    /** Resolve overloaded denotation to pick the ones with the given signature
      *  when seen from prefix `site`.
      *  @param relaxed  When true, consider only parameter signatures for a match.
      */
-    def atSignature(sig: Signature, site: Type = NoPrefix, relaxed: Boolean = false)(implicit ctx: Context): SingleDenotation
+    def atSignature(sig: Signature, site: Type = NoPrefix, relaxed: Boolean = false)(implicit ctx: Context): Denotation
 
     /** The variant of this denotation that's current in the given context, or
      *  `NotDefinedHereDenotation` if this denotation does not exist at current phase, but
@@ -144,6 +146,9 @@ object Denotations {
     /** Is this denotation different from NoDenotation or an ErrorDenotation? */
     def exists: Boolean = true
 
+    /** A denotation with the info of this denotation transformed using `f` */
+    def mapInfo(f: Type => Type)(implicit ctx: Context): Denotation
+
     /** If this denotation does not exist, fallback to alternative */
     final def orElse(that: => Denotation) = if (this.exists) this else that
 
@@ -157,7 +162,10 @@ object Denotations {
      *  or NoDenotation if no satisfying alternative exists.
      *  @throws TypeError if there is at more than one alternative that satisfies `p`.
      */
-    def suchThat(p: Symbol => Boolean): SingleDenotation
+    def suchThat(p: Symbol => Boolean)(implicit ctx: Context): SingleDenotation
+
+    /** If this is a SingleDenotation, return it, otherwise throw a TypeError */
+    def checkUnique(implicit ctx: Context): SingleDenotation = suchThat(alwaysTrue)
 
     /** Does this denotation have an alternative that satisfies the predicate `p`? */
     def hasAltWith(p: SingleDenotation => Boolean): Boolean
@@ -227,13 +235,17 @@ object Denotations {
     /** The alternative of this denotation that has a type matching `targetType` when seen
      *  as a member of type `site`, `NoDenotation` if none exists.
      */
-    def matchingDenotation(site: Type, targetType: Type)(implicit ctx: Context): SingleDenotation =
-      if (isOverloaded)
-        atSignature(targetType.signature, site, relaxed = true).matchingDenotation(site, targetType)
-      else if (exists && !site.memberInfo(symbol).matchesLoosely(targetType))
-        NoDenotation
-      else
-        asSingleDenotation
+    def matchingDenotation(site: Type, targetType: Type)(implicit ctx: Context): SingleDenotation = {
+      def qualifies(sym: Symbol) = site.memberInfo(sym).matchesLoosely(targetType)
+      if (isOverloaded) {
+        atSignature(targetType.signature, site, relaxed = true) match {
+          case sd: SingleDenotation => sd.matchingDenotation(site, targetType)
+          case md => md.suchThat(qualifies(_))
+        }
+      }
+      else if (exists && !qualifies(symbol)) NoDenotation
+      else asSingleDenotation
+    }
 
     /** Form a denotation by conjoining with denotation `that`.
      *
@@ -282,6 +294,7 @@ object Denotations {
             val info2 = denot2.info
             val sym1 = denot1.symbol
             val sym2 = denot2.symbol
+
             val sym2Accessible = sym2.isAccessibleFrom(pre)
 
             /** Does `sym1` come before `sym2` in the linearization of `pre`? */
@@ -290,19 +303,49 @@ object Denotations {
                 case bc :: bcs1 => (sym1 eq bc) || !(sym2 eq bc) && precedesIn(bcs1)
                 case Nil => true
               }
-              sym1.derivesFrom(sym2) ||
-                !sym2.derivesFrom(sym1) && precedesIn(pre.baseClasses)
+              (sym1 ne sym2) &&
+              (sym1.derivesFrom(sym2) ||
+                !sym2.derivesFrom(sym1) && precedesIn(pre.baseClasses))
             }
 
-            /** Preference according to partial pre-order (isConcrete, precedes) */
+            /** Similar to SymDenotation#accessBoundary, but without the special cases. */
+            def accessBoundary(sym: Symbol) =
+              if (sym.is(Private)) sym.owner
+              else sym.privateWithin.orElse(
+                if (sym.is(Protected)) sym.owner.enclosingPackageClass
+                else defn.RootClass
+              )
+
+            /** Establish a partial order "preference" order between symbols.
+             *  Give preference to `sym1` over `sym2` if one of the following
+             *  conditions holds, in decreasing order of weight:
+             *   1. sym1 is concrete and sym2 is abstract
+             *   2. The owner of sym1 comes before the owner of sym2 in the linearization
+             *      of the type of the prefix `pre`.
+             *   3. The access boundary of sym2 is properly contained in the access
+             *      boundary of sym1. For protected access, we count the enclosing
+             *      package as access boundary.
+             *   4. sym1 a method but sym2 is not.
+             *  The aim of these criteria is to give some disambiguation on access which
+             *   - does not depend on textual order or other arbitrary choices
+             *   - minimizes raising of doubleDef errors
+             */
             def preferSym(sym1: Symbol, sym2: Symbol) =
               sym1.eq(sym2) ||
                 sym1.isAsConcrete(sym2) &&
-                (!sym2.isAsConcrete(sym1) || precedes(sym1.owner, sym2.owner))
+                (!sym2.isAsConcrete(sym1) ||
+                 precedes(sym1.owner, sym2.owner) ||
+                 accessBoundary(sym2).isProperlyContainedIn(accessBoundary(sym1)) ||
+                 sym1.is(Method) && !sym2.is(Method))
 
             /** Sym preference provided types also override */
             def prefer(sym1: Symbol, sym2: Symbol, info1: Type, info2: Type) =
               preferSym(sym1, sym2) && info1.overrides(info2)
+
+            def handleDoubleDef =
+              if (preferSym(sym1, sym2)) denot1
+              else if (preferSym(sym2, sym1)) denot2
+              else doubleDefError(denot1, denot2, pre)
 
             if (sym2Accessible && prefer(sym2, sym1, info2, info1)) denot2
             else {
@@ -310,6 +353,7 @@ object Denotations {
               if (sym1Accessible && prefer(sym1, sym2, info1, info2)) denot1
               else if (sym1Accessible && sym2.exists && !sym2Accessible) denot1
               else if (sym2Accessible && sym1.exists && !sym1Accessible) denot2
+              else if (isDoubleDef(sym1, sym2)) handleDoubleDef
               else {
                 val sym =
                   if (!sym1.exists) sym2
@@ -418,19 +462,21 @@ object Denotations {
     final def validFor = denot1.validFor & denot2.validFor
     final def isType = false
     final def signature(implicit ctx: Context) = Signature.OverloadedSignature
-    def atSignature(sig: Signature, site: Type, relaxed: Boolean)(implicit ctx: Context): SingleDenotation =
-      denot1.atSignature(sig, site, relaxed) orElse denot2.atSignature(sig, site, relaxed)
+    def atSignature(sig: Signature, site: Type, relaxed: Boolean)(implicit ctx: Context): Denotation =
+      derivedMultiDenotation(denot1.atSignature(sig, site, relaxed), denot2.atSignature(sig, site, relaxed))
     def currentIfExists(implicit ctx: Context): Denotation =
       derivedMultiDenotation(denot1.currentIfExists, denot2.currentIfExists)
     def current(implicit ctx: Context): Denotation =
       derivedMultiDenotation(denot1.current, denot2.current)
     def altsWith(p: Symbol => Boolean): List[SingleDenotation] =
       denot1.altsWith(p) ++ denot2.altsWith(p)
-    def suchThat(p: Symbol => Boolean): SingleDenotation = {
+    def suchThat(p: Symbol => Boolean)(implicit ctx: Context): SingleDenotation = {
       val sd1 = denot1.suchThat(p)
       val sd2 = denot2.suchThat(p)
       if (sd1.exists)
-        if (sd2.exists) throw new TypeError(s"failure to disambiguate overloaded reference $this")
+        if (sd2.exists)
+          if (isDoubleDef(denot1.symbol, denot2.symbol)) doubleDefError(denot1, denot2)
+          else throw new TypeError(s"failure to disambiguate overloaded reference $this")
         else sd1
       else sd2
     }
@@ -443,6 +489,8 @@ object Denotations {
       else if (!d2.exists) d1
       else derivedMultiDenotation(d1, d2)
     }
+    def mapInfo(f: Type => Type)(implicit ctx: Context): Denotation =
+      derivedMultiDenotation(denot1.mapInfo(f), denot2.mapInfo(f))
     def derivedMultiDenotation(d1: Denotation, d2: Denotation) =
       if ((d1 eq denot1) && (d2 eq denot2)) this else MultiDenotation(d1, d2)
     override def toString = alternatives.mkString(" <and> ")
@@ -475,12 +523,15 @@ object Denotations {
       if ((symbol eq this.symbol) && (info eq this.info)) this
       else newLikeThis(symbol, info)
 
+    def mapInfo(f: Type => Type)(implicit ctx: Context): SingleDenotation =
+      derivedSingleDenotation(symbol, f(info))
+
     def orElse(that: => SingleDenotation) = if (this.exists) this else that
 
     def altsWith(p: Symbol => Boolean): List[SingleDenotation] =
       if (exists && p(symbol)) this :: Nil else Nil
 
-    def suchThat(p: Symbol => Boolean): SingleDenotation =
+    def suchThat(p: Symbol => Boolean)(implicit ctx: Context): SingleDenotation =
       if (exists && p(symbol)) this else NoDenotation
 
     def hasAltWith(p: SingleDenotation => Boolean): Boolean =
@@ -580,7 +631,8 @@ object Denotations {
      */
     private def bringForward()(implicit ctx: Context): SingleDenotation = this match {
       case denot: SymDenotation if ctx.stillValid(denot) =>
-        assert(ctx.runId > validFor.runId, s"denotation $denot invalid in run ${ctx.runId}. ValidFor: $validFor")
+        assert(ctx.runId > validFor.runId || ctx.settings.YtestPickler.value, // mixing test pickler with debug printing can travel back in time
+            s"denotation $denot invalid in run ${ctx.runId}. ValidFor: $validFor")
         var d: SingleDenotation = denot
         do {
           d.validFor = Period(ctx.period.runId, d.validFor.firstPhaseId, d.validFor.lastPhaseId)
@@ -645,7 +697,13 @@ object Denotations {
               var startPid = nextTransformerId + 1
               val transformer = ctx.denotTransformers(nextTransformerId)
               //println(s"transforming $this with $transformer")
-              next = transformer.transform(cur)(ctx.withPhase(transformer)).syncWithParents
+              try {
+                next = transformer.transform(cur)(ctx.withPhase(transformer)).syncWithParents
+              } catch {
+                case ex: CyclicReference =>
+                  println(s"error while transforming $this") // DEBUG
+                  throw ex
+              }
               if (next eq cur)
                 startPid = cur.validFor.firstPhaseId
               else {
@@ -899,6 +957,27 @@ object Denotations {
    *  Produced by staticRef, consumed by requiredSymbol.
    */
   case class NoQualifyingRef(alts: List[SingleDenotation])(implicit ctx: Context) extends ErrorDenotation
+
+  /** A double definition
+   */
+  def isDoubleDef(sym1: Symbol, sym2: Symbol)(implicit ctx: Context): Boolean =
+    (sym1.exists && sym2.exists &&
+    (sym1 ne sym2) && (sym1.owner eq sym2.owner) &&
+    !sym1.is(Bridge) && !sym2.is(Bridge))
+
+  def doubleDefError(denot1: Denotation, denot2: Denotation, pre: Type = NoPrefix)(implicit ctx: Context): Nothing = {
+    val sym1 = denot1.symbol
+    val sym2 = denot2.symbol
+    def fromWhere = if (pre == NoPrefix) "" else i"\nwhen seen as members of $pre"
+    throw new MergeError(
+      i"""cannot merge
+         |  $sym1: ${sym1.info}  and
+         |  $sym2: ${sym2.info};
+         |they are both defined in ${sym1.owner} but have matching signatures
+         |  ${denot1.info} and
+         |  ${denot2.info}$fromWhere""".stripMargin,
+      denot2.info, denot2.info)
+  }
 
   // --------------- PreDenotations -------------------------------------------------
 

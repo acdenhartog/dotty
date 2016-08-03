@@ -81,5 +81,13 @@ object Mode {
   /** We are currently unpickling Scala2 info */
   val Scala2Unpickling = newMode(13, "Scala2Unpickling")
 
+  /** Use Scala2 scheme for overloading and implicit resolution */
+  val OldOverloadingResolution = newMode(14, "OldOverloadingResolution")
+
+  /** Allow hk applications of type lambdas to wildcard arguments;
+   *  used for checking that such applications do not normally arise
+   */
+  val AllowLambdaWildcardApply = newMode(15, "AllowHKApplyToWildcards")
+
   val PatternOrType = Pattern | Type
 }

@@ -46,7 +46,11 @@ object desugar {
      */
     override def ensureCompletions(implicit ctx: Context) =
       if (!(ctx.owner is Package))
-        if (ctx.owner is ModuleClass) ctx.owner.linkedClass.ensureCompleted()
+        if (ctx.owner.isClass) {
+          ctx.owner.ensureCompleted()
+          if (ctx.owner is ModuleClass)
+            ctx.owner.linkedClass.ensureCompleted()
+        }
         else ensureCompletions(ctx.outer)
 
     /** Return info of original symbol, where all references to siblings of the
@@ -62,7 +66,7 @@ object desugar {
       val relocate = new TypeMap {
         val originalOwner = sym.owner
         def apply(tp: Type) = tp match {
-          case tp: NamedType if tp.symbol.owner eq originalOwner =>
+          case tp: NamedType if tp.symbol.exists && (tp.symbol.owner eq originalOwner) =>
             val defctx = ctx.outersIterator.dropWhile(_.scope eq ctx.scope).next
             var local = defctx.denotNamed(tp.name).suchThat(_ is ParamOrAccessor).symbol
             if (local.exists) (defctx.owner.thisType select local).dealias
@@ -954,7 +958,7 @@ object desugar {
    *  Example: Given
    *
    *      class C
-   *      type T1 extends C { type T <: A }
+   *      type T1 = C { type T <: A }
    *
    *  the refined type
    *

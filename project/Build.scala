@@ -9,9 +9,14 @@ import org.scalajs.sbtplugin.ScalaJSPlugin.autoImport._
 
 object DottyBuild extends Build {
 
+  val baseVersion = "0.1"
+  val isNightly = sys.props.get("NIGHTLYBUILD") == Some("yes")
+
   val jenkinsMemLimit = List("-Xmx1300m")
 
   val JENKINS_BUILD = "dotty.jenkins.build"
+
+  val scalaCompiler = "me.d-d" % "scala-compiler" % "2.11.5-20160322-171045-e19b30b3cd"
 
   val agentOptions = List(
     // "-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address=5005"
@@ -23,8 +28,13 @@ object DottyBuild extends Build {
   override def settings: Seq[Setting[_]] = {
     super.settings ++ Seq(
       scalaVersion in Global := "2.11.5",
-      version in Global := "0.1-SNAPSHOT",
-      organization in Global := "org.scala-lang",
+      version in Global := {
+        if (isNightly)
+          baseVersion + "-" + VersionUtil.commitDate + "-" + VersionUtil.gitHash + "-NIGHTLY"
+        else
+          baseVersion + "-SNAPSHOT"
+      },
+      organization in Global := "ch.epfl.lamp",
       organizationName in Global := "LAMP/EPFL",
       organizationHomepage in Global := Some(url("http://lamp.epfl.ch")),
       homepage in Global := Some(url("https://github.com/lampepfl/dotty")),
@@ -48,7 +58,8 @@ object DottyBuild extends Build {
       autoScalaLibrary := false,
       //Remove javac invalid options in Compile doc
       javacOptions in (Compile, doc) --= Seq("-Xlint:unchecked", "-Xlint:deprecation")
-    )
+    ).
+    settings(publishing)
 
   lazy val dotty = project.in(file(".")).
     dependsOn(`dotty-interfaces`).
@@ -64,6 +75,10 @@ object DottyBuild extends Build {
       unmanagedSourceDirectories in Compile := Seq((scalaSource in Compile).value),
       unmanagedSourceDirectories in Test := Seq((scalaSource in Test).value),
 
+      // set system in/out for repl
+      connectInput in run := true,
+      outputStrategy := Some(StdoutOutput),
+
       // Generate compiler.properties, used by sbt
       resourceGenerators in Compile += Def.task {
         val file = (resourceManaged in Compile).value / "compiler.properties"
@@ -77,15 +92,15 @@ object DottyBuild extends Build {
       com.typesafe.sbteclipse.plugin.EclipsePlugin.EclipseKeys.withSource := true,
 
       // get libraries onboard
-      partestDeps := Seq("me.d-d" % "scala-compiler" % "2.11.5-20160322-171045-e19b30b3cd",
+      partestDeps := Seq(scalaCompiler,
                          "org.scala-lang" % "scala-reflect" % scalaVersion.value,
                          "org.scala-lang" % "scala-library" % scalaVersion.value % "test"),
       libraryDependencies ++= partestDeps.value,
       libraryDependencies ++= Seq("org.scala-lang.modules" %% "scala-xml" % "1.0.1",
                                   "org.scala-lang.modules" %% "scala-partest" % "1.0.11" % "test",
                                   "com.novocode" % "junit-interface" % "0.11" % "test",
-                                  "jline" % "jline" % "2.12"),
-
+                                  "com.googlecode.java-diff-utils" % "diffutils" % "1.3.0",
+                                  "com.typesafe.sbt" % "sbt-interface" % sbtVersion.value),
       // enable improved incremental compilation algorithm
       incOptions := incOptions.value.withNameHashing(true),
 
@@ -162,7 +177,7 @@ object DottyBuild extends Build {
           path = file.getAbsolutePath
         } yield "-Xbootclasspath/p:" + path
         // dotty itself needs to be in the bootclasspath
-        val fullpath = ("-Xbootclasspath/a:" + bin) :: path.toList
+        val fullpath = ("-Xbootclasspath/p:" + "dotty.jar") :: ("-Xbootclasspath/a:" + bin) :: path.toList
         // System.err.println("BOOTPATH: " + fullpath)
 
         val travis_build = // propagate if this is a travis build
@@ -185,7 +200,69 @@ object DottyBuild extends Build {
       addCommandAlias("partest",                   ";test:package;package;test:runMain dotc.build;lockPartestFile;test:test;runPartestRunner") ++
       addCommandAlias("partest-only",              ";test:package;package;test:runMain dotc.build;lockPartestFile;test:test-only dotc.tests;runPartestRunner") ++
       addCommandAlias("partest-only-no-bootstrap", ";test:package;package;                        lockPartestFile;test:test-only dotc.tests;runPartestRunner")
-    )
+    ).
+    settings(publishing)
+
+  lazy val `dotty-bridge` = project.in(file("bridge")).
+    dependsOn(dotty).
+    settings(
+      overrideScalaVersionSetting,
+
+      description := "sbt compiler bridge for Dotty",
+      resolvers += Resolver.typesafeIvyRepo("releases"),
+      libraryDependencies ++= Seq(
+        "com.typesafe.sbt" % "sbt-interface" % sbtVersion.value,
+        "org.scala-sbt" % "api" % sbtVersion.value % "test",
+        "org.specs2" %% "specs2" % "2.3.11" % "test"
+      ),
+      version := {
+        if (isNightly)
+          "0.1.1-" + VersionUtil.commitDate + "-" + VersionUtil.gitHash + "-NIGHTLY"
+        else
+          "0.1.1-SNAPSHOT"
+      },
+      // The sources should be published with crossPaths := false since they
+      // need to be compiled by the project using the bridge.
+      crossPaths := false,
+
+      // Don't publish any binaries for the bridge because of the above
+      publishArtifact in (Compile, packageBin) := false,
+
+      fork in Test := true,
+      parallelExecution in Test := false
+    ).
+    settings(ScriptedPlugin.scriptedSettings: _*).
+    settings(
+      ScriptedPlugin.scriptedLaunchOpts := Seq("-Xmx1024m"),
+      ScriptedPlugin.scriptedBufferLog := false
+      // TODO: Use this instead of manually copying DottyInjectedPlugin.scala
+      // everywhere once https://github.com/sbt/sbt/issues/2601 gets fixed.
+      /*,
+      ScriptedPlugin.scriptedPrescripted := { f =>
+        IO.write(inj, """
+import sbt._
+import Keys._
+
+object DottyInjectedPlugin extends AutoPlugin {
+  override def requires = plugins.JvmPlugin
+  override def trigger = allRequirements
+
+  override val projectSettings = Seq(
+    scalaVersion := "0.1-SNAPSHOT",
+    scalaOrganization := "ch.epfl.lamp",
+    scalacOptions += "-language:Scala2",
+    scalaBinaryVersion  := "2.11",
+    autoScalaLibrary := false,
+    libraryDependencies ++= Seq("org.scala-lang" % "scala-library" % "2.11.5"),
+    scalaCompilerBridgeSource := ("ch.epfl.lamp" % "dotty-bridge" % "0.1.1-SNAPSHOT" % "component").sources()
+  )
+}
+""")
+      }
+      */
+    ).
+    settings(publishing)
+
 
   /** A sandbox to play with the Scala.js back-end of dotty.
    *
@@ -237,8 +314,10 @@ object DottyBuild extends Build {
 
       baseDirectory in (Test,run) := (baseDirectory in dotty).value,
 
-      libraryDependencies ++= Seq("com.storm-enroute" %% "scalameter" % "0.6" % Test,
-        "com.novocode" % "junit-interface" % "0.11"),
+      libraryDependencies ++= Seq(
+        scalaCompiler % Test,
+        "com.storm-enroute" %% "scalameter" % "0.6" % Test
+      ),
 
       fork in Test := true,
       parallelExecution in Test := false,
@@ -265,6 +344,69 @@ object DottyBuild extends Build {
         res
       }
     )
+
+   lazy val `scala-library` = project
+    .settings(
+      libraryDependencies += "org.scala-lang" % "scala-library" % scalaVersion.value
+    )
+    .settings(publishing)
+
+   lazy val publishing = Seq(
+     publishMavenStyle := true,
+     publishArtifact := true,
+     isSnapshot := version.value.contains("SNAPSHOT"),
+     publishTo := {
+       val nexus = "https://oss.sonatype.org/"
+       if (isSnapshot.value)
+         Some("snapshots" at nexus + "content/repositories/snapshots")
+       else
+         Some("releases"  at nexus + "service/local/staging/deploy/maven2")
+     },
+     publishArtifact in Test := false,
+     homepage := Some(url("https://github.com/lampepfl/dotty")),
+     licenses += ("BSD New",
+       url("https://github.com/lampepfl/dotty/blob/master/LICENSE.md")),
+     scmInfo := Some(
+       ScmInfo(
+         url("https://github.com/lampepfl/dotty"),
+         "scm:git:git@github.com:lampepfl/dotty.git"
+       )
+     ),
+     pomExtra := (
+       <developers>
+         <developer>
+           <id>odersky</id>
+           <name>Martin Odersky</name>
+           <email>martin.odersky@epfl.ch</email>
+           <url>https://github.com/odersky</url>
+         </developer>
+         <developer>
+           <id>DarkDimius</id>
+           <name>Dmitry Petrashko</name>
+           <email>me@d-d.me</email>
+           <url>https://d-d.me</url>
+         </developer>
+         <developer>
+           <id>smarter</id>
+           <name>Guillaume Martres</name>
+           <email>smarter@ubuntu.com</email>
+           <url>http://guillaume.martres.me</url>
+         </developer>
+         <developer>
+           <id>felixmulder</id>
+           <name>Felix Mulder</name>
+           <email>felix.mulder@gmail.com</email>
+           <url>http://felixmulder.com</url>
+         </developer>
+         <developer>
+           <id>liufengyun</id>
+           <name>Liu Fengyun</name>
+           <email>liufengyun@chaos-lab.com</email>
+           <url>http://chaos-lab.com</url>
+         </developer>
+       </developers>
+     )
+   )
 
   // Partest tasks
   lazy val lockPartestFile = TaskKey[Unit]("lockPartestFile", "Creates the lock file at ./tests/locks/partest-<pid>.lock")

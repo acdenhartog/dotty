@@ -436,7 +436,8 @@ object Flags {
 
   /** Flags representing modifiers that can appear in trees */
   final val ModifierFlags =
-    SourceModifierFlags | Module | Param | Synthetic | Package | Local | commonFlags(Mutable)
+    SourceModifierFlags | Module | Param | Synthetic | Package | Local |
+    commonFlags(Mutable)
       // | Trait is subsumed by commonFlags(Lazy) from SourceModifierFlags
 
   assert(ModifierFlags.isTermFlags && ModifierFlags.isTypeFlags)
@@ -447,7 +448,7 @@ object Flags {
   /** Flags guaranteed to be set upon symbol creation */
   final val FromStartFlags =
     AccessFlags | Module | Package | Deferred | Final | MethodOrHKCommon | Param | ParamAccessor | Scala2ExistentialCommon |
-    InSuperCall | Touched | JavaStatic | CovariantOrOuter | ContravariantOrLabel | ExpandedName | AccessorOrSealed |
+    Mutable.toCommonFlags | InSuperCall | Touched | JavaStatic | CovariantOrOuter | ContravariantOrLabel | ExpandedName | AccessorOrSealed |
     CaseAccessorOrBaseTypeArg | Fresh | Frozen | Erroneous | ImplicitCommon | Permanent | Synthetic |
     LazyOrTrait | SuperAccessorOrScala2x | SelfNameOrImplClass
 
@@ -524,6 +525,9 @@ object Flags {
 
   /** Either method or lazy */
   final val MethodOrLazy = Method | Lazy
+
+  /** Either method or lazy or deferred */
+  final val MethodOrLazyOrDeferred = Method | Lazy | Deferred
 
   /** Labeled `private` or `final` */
   final val PrivateOrFinal = Private | Final

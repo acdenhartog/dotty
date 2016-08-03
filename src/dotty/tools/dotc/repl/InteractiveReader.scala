@@ -2,6 +2,8 @@ package dotty.tools
 package dotc
 package repl
 
+import dotc.core.Contexts.Context
+
 /** Reads lines from an input stream */
 trait InteractiveReader {
   def readLine(prompt: String): String
@@ -11,16 +13,8 @@ trait InteractiveReader {
 /** The current Scala REPL know how to do this flexibly.
  */
 object InteractiveReader {
-  /** Create an interactive reader.  Uses JLine if the
-   *  library is available, but otherwise uses a
-   *  SimpleReader. */
-  def createDefault(): InteractiveReader = {
-    try {
-      new JLineReader()
-    } catch {
-      case e =>
-        //out.println("jline is not available: " + e) //debug
-	      new SimpleReader()
-    }
+  /** Create an interactive reader */
+  def createDefault(in: Interpreter)(implicit ctx: Context): InteractiveReader = {
+    new AmmoniteReader(in)
   }
 }

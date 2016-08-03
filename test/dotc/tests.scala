@@ -23,12 +23,11 @@ class tests extends CompilerTest {
   val defaultOutputDir = "./out/"
 
   implicit val defaultOptions = noCheckOptions ++ List(
-      "-Yno-deep-subtypes", "-Yno-double-bindings",
+      "-Yno-deep-subtypes", "-Yno-double-bindings", "-Yforce-sbt-phases",
       "-d", defaultOutputDir) ++ {
     if (isRunByJenkins) List("-Ycheck:tailrec,resolveSuper,mixin,restoreScopes,labelDef") // should be Ycheck:all, but #725
     else List("-Ycheck:tailrec,resolveSuper,mixin,restoreScopes,labelDef")
   }
-
 
   val testPickling = List("-Xprint-types", "-Ytest-pickler", "-Ystop-after:pickler")
 
@@ -119,10 +118,14 @@ class tests extends CompilerTest {
   @Test def neg_typedIdents() = compileDir(negDir, "typedIdents")
 
   val negCustomArgs = negDir + "customArgs/"
+
+  @Test def neg_cli_error = compileFile(negCustomArgs, "cliError", List("-thisOptionDoesNotExist"))
+
   @Test def neg_typers() = compileFile(negCustomArgs, "typers")(allowDoubleBindings)
-  @Test def neg_overrideClass = compileFile(negCustomArgs, "overrideClass", List("-language:Scala2"))
+  @Test def neg_overrideClass = compileFile(negCustomArgs, "overrideClass", scala2mode)
   @Test def neg_autoTupling = compileFile(negCustomArgs, "autoTuplingTest", args = "-language:noAutoTupling" :: Nil)
   @Test def neg_i1050 = compileFile(negCustomArgs, "i1050", List("-strict"))
+  @Test def neg_i1240 = compileFile(negCustomArgs, "i1240")(allowDoubleBindings)
 
   val negTailcallDir = negDir + "tailcall/"
   @Test def neg_tailcall_t1672b = compileFile(negTailcallDir, "t1672b")
@@ -131,6 +134,10 @@ class tests extends CompilerTest {
   @Test def neg_tailcall = compileFile(negTailcallDir, "tailrec")
   @Test def neg_tailcall2 = compileFile(negTailcallDir, "tailrec-2")
   @Test def neg_tailcall3 = compileFile(negTailcallDir, "tailrec-3")
+
+  @Test def neg_nopredef = compileFile(negCustomArgs, "nopredef", List("-Yno-predef"))
+  @Test def neg_noimports = compileFile(negCustomArgs, "noimports", List("-Yno-imports"))
+  @Test def neg_noimpots2 = compileFile(negCustomArgs, "noimports2", List("-Yno-imports"))
 
   @Test def run_all = runFiles(runDir)
 
@@ -145,6 +152,7 @@ class tests extends CompilerTest {
   @Test def compileMixed = compileLine(
       """tests/pos/B.scala
         |./scala-scala/src/library/scala/collection/immutable/Seq.scala
+        |./scala-scala/src/library/scala/collection/parallel/ParSeq.scala
         |./scala-scala/src/library/scala/package.scala
         |./scala-scala/src/library/scala/collection/GenSeqLike.scala
         |./scala-scala/src/library/scala/collection/SeqLike.scala
@@ -155,7 +163,8 @@ class tests extends CompilerTest {
 
   @Test def dotc_ast = compileDir(dotcDir, "ast")
   @Test def dotc_config = compileDir(dotcDir, "config")
-  @Test def dotc_core = compileDir(dotcDir, "core")("-Yno-double-bindings" :: allowDeepSubtypes)// twice omitted to make tests run faster
+  @Test def dotc_core = compileDir(dotcDir, "core")(allowDeepSubtypes)// twice omitted to make tests run faster
+  @Test def dotc_core_nocheck = compileDir(dotcDir, "core")(noCheckOptions)
 
 // This directory doesn't exist anymore
 //  @Test def dotc_core_pickling = compileDir(coreDir, "pickling")(allowDeepSubtypes)// twice omitted to make tests run faster

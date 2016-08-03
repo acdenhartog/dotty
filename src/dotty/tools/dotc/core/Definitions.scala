@@ -12,7 +12,13 @@ import collection.mutable
 import scala.reflect.api.{ Universe => ApiUniverse }
 
 object Definitions {
-  val MaxFunctionArity, MaxTupleArity = 22
+  val MaxTupleArity, MaxAbstractFunctionArity = 22
+  val MaxFunctionArity = 30
+    // Awaiting a definite solution that drops the limit altogether, 30 gives a safety
+    // margin over the previous 22, so that treecopiers in miniphases are allowed to
+    // temporarily create larger closures. This is needed in lambda lift where large closures
+    // are first formed by treecopiers before they are split apart into parameters and
+    // environment in the lambdalift transform itself.
 }
 
 /** A class defining symbols and types of standard definitions
@@ -86,17 +92,17 @@ class Definitions {
   }
 
   private def newPolyMethod(cls: ClassSymbol, name: TermName, typeParamCount: Int,
-                    resultTypeFn: PolyType => Type, flags: FlagSet = EmptyFlags) = {
+                    resultTypeFn: GenericType => Type, flags: FlagSet = EmptyFlags) = {
     val tparamNames = tpnme.syntheticTypeParamNames(typeParamCount)
     val tparamBounds = tparamNames map (_ => TypeBounds.empty)
     val ptype = PolyType(tparamNames)(_ => tparamBounds, resultTypeFn)
     newMethod(cls, name, ptype, flags)
   }
 
-  private def newT1ParameterlessMethod(cls: ClassSymbol, name: TermName, resultTypeFn: PolyType => Type, flags: FlagSet) =
+  private def newT1ParameterlessMethod(cls: ClassSymbol, name: TermName, resultTypeFn: GenericType => Type, flags: FlagSet) =
     newPolyMethod(cls, name, 1, resultTypeFn, flags)
 
-  private def newT1EmptyParamsMethod(cls: ClassSymbol, name: TermName, resultTypeFn: PolyType => Type, flags: FlagSet) =
+  private def newT1EmptyParamsMethod(cls: ClassSymbol, name: TermName, resultTypeFn: GenericType => Type, flags: FlagSet) =
     newPolyMethod(cls, name, 1, pt => MethodType(Nil, resultTypeFn(pt)), flags)
 
   private def mkArityArray(name: String, arity: Int, countFrom: Int): Array[TypeRef] = {
@@ -167,7 +173,7 @@ class Definitions {
     lazy val Any_hashCode = newMethod(AnyClass, nme.hashCode_, MethodType(Nil, IntType))
     lazy val Any_toString = newMethod(AnyClass, nme.toString_, MethodType(Nil, StringType))
     lazy val Any_##       = newMethod(AnyClass, nme.HASHHASH, ExprType(IntType), Final)
-    lazy val Any_getClass = newMethod(AnyClass, nme.getClass_, MethodType(Nil, ClassClass.typeRef), Final)
+    lazy val Any_getClass = newMethod(AnyClass, nme.getClass_, MethodType(Nil, ClassClass.typeRef.appliedTo(TypeBounds.empty)), Final)
     lazy val Any_isInstanceOf = newT1ParameterlessMethod(AnyClass, nme.isInstanceOf_, _ => BooleanType, Final)
     lazy val Any_asInstanceOf = newT1ParameterlessMethod(AnyClass, nme.asInstanceOf_, PolyParam(_, 0), Final)
 
@@ -244,6 +250,9 @@ class Definitions {
 
   lazy val DottyPredefModuleRef = ctx.requiredModuleRef("dotty.DottyPredef")
   def DottyPredefModule(implicit ctx: Context) = DottyPredefModuleRef.symbol
+
+    def Predef_eqAny(implicit ctx: Context) = DottyPredefModule.requiredMethod(nme.eqAny)
+
   lazy val DottyArraysModuleRef = ctx.requiredModuleRef("dotty.runtime.Arrays")
   def DottyArraysModule(implicit ctx: Context) = DottyArraysModuleRef.symbol
     def newGenericArrayMethod(implicit ctx: Context) = DottyArraysModule.requiredMethod("newGenericArray")
@@ -421,12 +430,18 @@ class Definitions {
     def Product_productArity(implicit ctx: Context) = Product_productArityR.symbol
     lazy val Product_productPrefixR = ProductClass.requiredMethodRef(nme.productPrefix)
     def Product_productPrefix(implicit ctx: Context) = Product_productPrefixR.symbol
-  lazy val LanguageModuleRef          = ctx.requiredModule("dotty.language")
+  lazy val LanguageModuleRef = ctx.requiredModule("dotty.language")
   def LanguageModuleClass(implicit ctx: Context) = LanguageModuleRef.symbol.moduleClass.asClass
+  lazy val Scala2LanguageModuleRef = ctx.requiredModule("scala.language")
+  def Scala2LanguageModuleClass(implicit ctx: Context) = Scala2LanguageModuleRef.symbol.moduleClass.asClass
   lazy val NonLocalReturnControlType: TypeRef   = ctx.requiredClassRef("scala.runtime.NonLocalReturnControl")
+
   lazy val ClassTagType = ctx.requiredClassRef("scala.reflect.ClassTag")
   def ClassTagClass(implicit ctx: Context) = ClassTagType.symbol.asClass
   def ClassTagModule(implicit ctx: Context) = ClassTagClass.companionModule
+
+  lazy val EqType = ctx.requiredClassRef("scala.Eq")
+  def EqClass(implicit ctx: Context) = EqType.symbol.asClass
 
   // Annotation base classes
   lazy val AnnotationType              = ctx.requiredClassRef("scala.annotation.Annotation")
@@ -479,6 +494,8 @@ class Definitions {
   def TASTYLongSignatureAnnot(implicit ctx: Context) = TASTYLongSignatureAnnotType.symbol.asClass
   lazy val TailrecAnnotType = ctx.requiredClassRef("scala.annotation.tailrec")
   def TailrecAnnot(implicit ctx: Context) = TailrecAnnotType.symbol.asClass
+  lazy val SwitchAnnotType = ctx.requiredClassRef("scala.annotation.switch")
+  def SwitchAnnot(implicit ctx: Context) = SwitchAnnotType.symbol.asClass
   lazy val ThrowsAnnotType = ctx.requiredClassRef("scala.throws")
   def ThrowsAnnot(implicit ctx: Context) = ThrowsAnnotType.symbol.asClass
   lazy val TransientAnnotType                = ctx.requiredClassRef("scala.transient")
@@ -576,7 +593,7 @@ class Definitions {
 
   // ----- Symbol sets ---------------------------------------------------
 
-  lazy val AbstractFunctionType = mkArityArray("scala.runtime.AbstractFunction", MaxFunctionArity, 0)
+  lazy val AbstractFunctionType = mkArityArray("scala.runtime.AbstractFunction", MaxAbstractFunctionArity, 0)
   val AbstractFunctionClassPerRun = new PerRun[Array[Symbol]](implicit ctx => AbstractFunctionType.map(_.symbol.asClass))
   def AbstractFunctionClass(n: Int)(implicit ctx: Context) = AbstractFunctionClassPerRun()(ctx)(n)
   lazy val FunctionType = mkArityArray("scala.Function", MaxFunctionArity, 0)
@@ -618,15 +635,24 @@ class Definitions {
   def isTupleClass(cls: Symbol) = isVarArityClass(cls, tpnme.Tuple)
   def isProductClass(cls: Symbol) = isVarArityClass(cls, tpnme.Product)
 
-  val RootImportFns = List[() => TermRef](
-      () => JavaLangPackageVal.termRef,
-      () => ScalaPackageVal.termRef,
+  val StaticRootImportFns = List[() => TermRef](
+    () => JavaLangPackageVal.termRef,
+    () => ScalaPackageVal.termRef
+  )
+
+  val PredefImportFns = List[() => TermRef](
       () => ScalaPredefModuleRef,
-      () => DottyPredefModuleRef)
+      () => DottyPredefModuleRef
+  )
+
+  lazy val RootImportFns =
+    if (ctx.settings.YnoImports.value) List.empty[() => TermRef]
+    else if (ctx.settings.YnoPredef.value) StaticRootImportFns
+    else StaticRootImportFns ++ PredefImportFns
 
   lazy val RootImportTypes = RootImportFns.map(_())
 
-  /** `Modules whose members are in the default namespace and their module classes */
+  /** Modules whose members are in the default namespace and their module classes */
   lazy val UnqualifiedOwnerTypes: Set[NamedType] =
     RootImportTypes.toSet[NamedType] ++ RootImportTypes.map(_.symbol.moduleClass.typeRef)
 
@@ -653,71 +679,6 @@ class Definitions {
   }
 
   def functionArity(tp: Type)(implicit ctx: Context) = tp.dealias.argInfos.length - 1
-
-  // ----- LambdaXYZ traits ------------------------------------------
-
-  private var myLambdaTraits: Set[Symbol] = Set()
-
-  /** The set of HigherKindedXYZ traits encountered so far */
-  def lambdaTraits: Set[Symbol] = myLambdaTraits
-
-  private var LambdaTraitForVariances = mutable.Map[List[Int], ClassSymbol]()
-
-  /** The HigherKinded trait corresponding to symbols `boundSyms` (which are assumed
-   *  to be the type parameters of a higher-kided type). This is a class symbol that
-   *  would be generated by the following schema.
-   *
-   *      trait LambdaXYZ extends Object with P1 with ... with Pn {
-   *        type v_1 hk$0; ...; type v_N hk$N;
-   *        type +$Apply
-   *      }
-   *
-   *  Here:
-   *
-   *   - v_i are the variances of the bound symbols (i.e. +, -, or empty).
-   *   - XYZ is a string of length N with one letter for each variant of a bound symbol,
-   *     using `P` (positive variance), `N` (negative variance), `I` (invariant).
-   *   - for each positive or negative variance v_i there is a parent trait Pj which
-   *     is the same as LambdaXYZ except that it has `I` in i-th position.
-   */
-  def LambdaTrait(vcs: List[Int]): ClassSymbol = {
-    assert(vcs.nonEmpty)
-
-    def varianceFlags(v: Int) = v match {
-      case -1 => Contravariant
-      case  0 => EmptyFlags
-      case  1 => Covariant
-    }
-
-    val completer = new LazyType  {
-      def complete(denot: SymDenotation)(implicit ctx: Context): Unit = {
-        val cls = denot.asClass.classSymbol
-        val paramDecls = newScope
-        for (i <- 0 until vcs.length)
-          newTypeParam(cls, tpnme.hkArg(i), varianceFlags(vcs(i)), paramDecls)
-        newTypeField(cls, tpnme.hkApply, Covariant, paramDecls)
-        val parentTraitRefs =
-          for (i <- 0 until vcs.length if vcs(i) != 0)
-          yield LambdaTrait(vcs.updated(i, 0)).typeRef
-        denot.info = ClassInfo(
-            ScalaPackageClass.thisType, cls, ObjectClass.typeRef :: parentTraitRefs.toList, paramDecls)
-      }
-    }
-
-    val traitName = tpnme.hkLambda(vcs)
-
-    def createTrait = {
-      val cls = newClassSymbol(
-        ScalaPackageClass,
-        traitName,
-        PureInterfaceCreationFlags | Synthetic,
-        completer)
-      myLambdaTraits += cls
-      cls
-    }
-
-    LambdaTraitForVariances.getOrElseUpdate(vcs, createTrait)
-  }
 
   // ----- primitive value class machinery ------------------------------------------
 
